@@ -296,6 +296,18 @@ function _rr_binary_hex ( BinaryString raw ) {
 	return out;
 }
 
+function _rr_binary_string_hex ( String raw ) {
+	let out := "";
+	let i := 0;
+	while ( i < length raw ) {
+		let b := ord( raw, i );
+		out _= substr( "0123456789ABCDEF", _rr_div_floor( b, 16 ) & 15, 1 );
+		out _= substr( "0123456789ABCDEF", b & 15, 1 );
+		i++;
+	}
+	return out;
+}
+
 function _rr_sql_type_is_binary ( String sql_type ) {
 	return lc(sql_type) ~ /(binary|blob)/;
 }
@@ -331,6 +343,9 @@ function _rr_value_text ( value, String sql_type := "" ) {
 		text := _rr_sql_type_is_binary(sql_type)
 			? uc(value.toString("hex"))
 			: value.toString("utf8");
+	}
+	else if ( _rr_sql_type_is_binary(sql_type) ) {
+		text := _rr_binary_string_hex("" _ value);
 	}
 	else {
 		text := "" _ value;
