@@ -1,0 +1,124 @@
+from test/more import *;
+
+requires_capability("db");
+requires_capability("fs");
+
+from rdf import NQuadsParser, rdf_datasets_isomorphic;
+from rdf/r2rml import r2rml_materialize;
+from std/db import DB;
+from std/io import Path;
+from std/string import split, trim;
+
+function _exec_sql_file ( dbh, Path path ) {
+	for ( let statement in split( path.slurp_utf8(), ";" ) ) {
+		let sql := trim(statement);
+		next if sql eq "";
+		dbh.prepare(sql).execute();
+	}
+}
+
+function _run_case ( String dir, String mapping_file, String expected_file ) {
+	let label := dir _ "/" _ mapping_file _ " matches expected W3C output";
+	let error := exception( function () {
+		let root := new Path("tests/w3c/rdb2rdf").child(dir);
+		let dbh := DB.temp();
+		_exec_sql_file( dbh, root.child("create.sql") );
+		let actual := r2rml_materialize(
+			dbh,
+			root.child(mapping_file).slurp_utf8(),
+			base: "http://example.com/base/",
+		);
+		let expected := ( new NQuadsParser() ).parse_string(
+			trim(root.child(expected_file).slurp_utf8()),
+		);
+		ok(
+			rdf_datasets_isomorphic( actual, expected ),
+			label,
+		);
+	} );
+	if ( error ) {
+		ok( false, label );
+		diag(error);
+	}
+}
+
+function _run_negative_case ( String dir, String mapping_file ) {
+	let label := dir _ "/" _ mapping_file _ " rejects invalid W3C mapping";
+	let root := new Path("tests/w3c/rdb2rdf").child(dir);
+	let error := exception( function () {
+		let dbh := DB.temp();
+		_exec_sql_file( dbh, root.child("create.sql") );
+		r2rml_materialize(
+			dbh,
+			root.child(mapping_file).slurp_utf8(),
+			base: "http://example.com/base/",
+		);
+	} );
+	ok( not (error == null), label );
+}
+
+_run_case( "D000-1table1column0rows", "r2rml.ttl", "mapped.nq" );
+_run_case( "D001-1table1column1row", "r2rmla.ttl", "mappeda.nq" );
+_run_case( "D001-1table1column1row", "r2rmlb.ttl", "mappedb.nq" );
+_run_case( "D002-1table2columns1row", "r2rmla.ttl", "mappeda.nq" );
+_run_case( "D002-1table2columns1row", "r2rmlb.ttl", "mappedb.nq" );
+_run_negative_case( "D002-1table2columns1row", "r2rmlc.ttl" );
+_run_case( "D002-1table2columns1row", "r2rmld.ttl", "mappedd.nq" );
+_run_negative_case( "D002-1table2columns1row", "r2rmle.ttl" );
+_run_negative_case( "D002-1table2columns1row", "r2rmlf.ttl" );
+_run_negative_case( "D002-1table2columns1row", "r2rmlg.ttl" );
+_run_negative_case( "D002-1table2columns1row", "r2rmlh.ttl" );
+_run_case( "D002-1table2columns1row", "r2rmli.ttl", "mappedi.nq" );
+_run_case( "D002-1table2columns1row", "r2rmlj.ttl", "mappedj.nq" );
+_run_negative_case( "D003-1table3columns1row", "r2rmla.ttl" );
+_run_case( "D003-1table3columns1row", "r2rmlb.ttl", "mappedb.nq" );
+_run_case( "D003-1table3columns1row", "r2rmlc.ttl", "mappedc.nq" );
+_run_case( "D004-1table2columns1row", "r2rmla.ttl", "mappeda.nq" );
+_run_negative_case( "D004-1table2columns1row", "r2rmlb.ttl" );
+_run_case( "D005-1table3columns3rows2duplicates", "r2rmla.ttl", "mappeda.nq" );
+_run_case( "D005-1table3columns3rows2duplicates", "r2rmlb.ttl", "mappedb.nq" );
+_run_case( "D006-1table1primarykey1column1row", "r2rmla.ttl", "mappeda.nq" );
+_run_case( "D007-1table1primarykey2columns1row", "r2rmla.ttl", "mappeda.nq" );
+_run_case( "D007-1table1primarykey2columns1row", "r2rmlb.ttl", "mappedb.nq" );
+_run_case( "D007-1table1primarykey2columns1row", "r2rmlc.ttl", "mappedc.nq" );
+_run_case( "D007-1table1primarykey2columns1row", "r2rmld.ttl", "mappedd.nq" );
+_run_case( "D007-1table1primarykey2columns1row", "r2rmle.ttl", "mappede.nq" );
+_run_case( "D007-1table1primarykey2columns1row", "r2rmlf.ttl", "mappedf.nq" );
+_run_case( "D007-1table1primarykey2columns1row", "r2rmlg.ttl", "mappedg.nq" );
+_run_negative_case( "D007-1table1primarykey2columns1row", "r2rmlh.ttl" );
+_run_case( "D008-1table1compositeprimarykey3columns1row", "r2rmla.ttl", "mappeda.nq" );
+_run_case( "D008-1table1compositeprimarykey3columns1row", "r2rmlb.ttl", "mappedb.nq" );
+_run_case( "D008-1table1compositeprimarykey3columns1row", "r2rmlc.ttl", "mappedc.nq" );
+_run_case( "D009-2tables1primarykey1foreignkey", "r2rmla.ttl", "mappeda.nq" );
+_run_case( "D009-2tables1primarykey1foreignkey", "r2rmlb.ttl", "mappedb.nq" );
+_run_case( "D009-2tables1primarykey1foreignkey", "r2rmlc.ttl", "mappedc.nq" );
+_run_case( "D009-2tables1primarykey1foreignkey", "r2rmld.ttl", "mappedd.nq" );
+_run_case( "D010-1table1primarykey3colums3rows", "r2rmla.ttl", "mappeda.nq" );
+_run_case( "D010-1table1primarykey3colums3rows", "r2rmlb.ttl", "mappedb.nq" );
+_run_case( "D010-1table1primarykey3colums3rows", "r2rmlc.ttl", "mappedc.nq" );
+_run_case( "D011-M2MRelations", "r2rmla.ttl", "mappeda.nq" );
+_run_case( "D011-M2MRelations", "r2rmlb.ttl", "mappedb.nq" );
+_run_case( "D012-2tables2duplicates0nulls", "r2rmla.ttl", "mappeda.nq" );
+_run_case( "D012-2tables2duplicates0nulls", "r2rmlb.ttl", "mappedb.nq" );
+_run_negative_case( "D012-2tables2duplicates0nulls", "r2rmlc.ttl" );
+_run_negative_case( "D012-2tables2duplicates0nulls", "r2rmld.ttl" );
+_run_case( "D012-2tables2duplicates0nulls", "r2rmle.ttl", "mappede.nq" );
+_run_case( "D013-1table1primarykey3columns2rows1nullvalue", "r2rmla.ttl", "mappeda.nq" );
+_run_case( "D014-3tables1primarykey1foreignkey", "r2rmla.ttl", "mappeda.nq" );
+_run_case( "D014-3tables1primarykey1foreignkey", "r2rmlb.ttl", "mappedb.nq" );
+_run_case( "D014-3tables1primarykey1foreignkey", "r2rmlc.ttl", "mappedc.nq" );
+_run_case( "D014-3tables1primarykey1foreignkey", "r2rmld.ttl", "mappedd.nq" );
+_run_case( "D015-1table3columns1composityeprimarykey3rows2languages", "r2rmla.ttl", "mappeda.nq" );
+_run_negative_case( "D015-1table3columns1composityeprimarykey3rows2languages", "r2rmlb.ttl" );
+_run_case( "D016-1table1primarykey10columns3rowsSQLdatatypes", "r2rmla.ttl", "mappeda.nq" );
+_run_case( "D016-1table1primarykey10columns3rowsSQLdatatypes", "r2rmlb.ttl", "mappedb.nq" );
+_run_case( "D016-1table1primarykey10columns3rowsSQLdatatypes", "r2rmlc.ttl", "mappedc.nq" );
+_run_case( "D016-1table1primarykey10columns3rowsSQLdatatypes", "r2rmld.ttl", "mappedd.nq" );
+_run_case( "D016-1table1primarykey10columns3rowsSQLdatatypes", "r2rmle.ttl", "mappede.nq" );
+_run_case( "D018-1table1primarykey2columns3rows", "r2rmla.ttl", "mappeda.nq" );
+_run_case( "D019-1table1primarykey3columns3rows", "r2rmla.ttl", "mappeda.nq" );
+_run_negative_case( "D019-1table1primarykey3columns3rows", "r2rmlb.ttl" );
+_run_case( "D020-1table1column5rows", "r2rmla.ttl", "mappeda.nq" );
+_run_negative_case( "D020-1table1column5rows", "r2rmlb.ttl" );
+
+done_testing();

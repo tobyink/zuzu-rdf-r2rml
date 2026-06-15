@@ -1,0 +1,973 @@
+=encoding utf8
+
+=head1 NAME
+
+rdf/r2rml - R2RML materialisation for rdf stores.
+
+=head1 SYNOPSIS
+
+  from rdf/r2rml import r2rml_materialize;
+  from rdf/store import RDFStore;
+  from std/db import DB;
+  
+  let dbh := DB.temp();
+  let store := RDFStore.temp();
+  store.install_schema();
+  r2rml_materialize( dbh, mapping_turtle, into: store );
+
+=head1 DESCRIPTION
+
+This module implements the W3C R2RML mapping vocabulary for generating RDF
+quads from a C<std/db> database handle. Mapping input may be supplied as
+pre-parsed RDF quads or as an RDF serialization parsed by a parser object.
+When no parser is supplied, Turtle is used.
+
+=head1 EXPORTS
+
+=head2 Constants
+
+=over
+
+=item C<R2RML_NS>
+
+The R2RML namespace IRI.
+
+=back
+
+=head2 Classes
+
+=over
+
+=item C<R2RMLProcessor>
+
+Construct with C<new R2RMLProcessor(dbh: dbh)>.
+
+=over
+
+=item C<< materialize(mapping, into := null, parser := null, base := "") >>
+
+Materializes an R2RML mapping into C<into> when supplied, otherwise returns
+an array of generated quads.
+
+=back
+
+=back
+
+=head2 Functions
+
+=over
+
+=item C<< r2rml_parse_mapping(mapping, parser := null, String base := "") >>
+
+Returns mapping RDF quads from either an array of quads or serialized RDF
+text.
+
+=item C<< r2rml_materialize(dbh, mapping, ... options) >>
+
+Convenience wrapper around C<R2RMLProcessor.materialize>.
+
+=back
+
+=head1 COPYRIGHT AND LICENCE
+
+B<< rdf/r2rml >> is copyright Toby Inkster.
+
+It is free software; you may redistribute it and/or modify it under
+the terms of either the Artistic License 1.0 or the GNU General Public
+License version 2.
+
+=cut
+
+from rdf/graph import rdf_quads_unique;
+from rdf/parser/turtle import TurtleParser;
+from rdf/term import
+	RDFBlank,
+	RDFDefaultGraph,
+	RDFIRI,
+	RDFLiteral,
+	RDFQuad,
+	RDF_NS,
+	XSD_NS,
+	rdf_blank,
+	rdf_default_graph,
+	rdf_iri,
+	rdf_literal,
+	rdf_quad,
+	rdf_term_hash,
+	rdf_term_key;
+from std/math import Math;
+from std/string/base64 import encode as _rr_b64_encode;
+from std/string/encode import decode as _rr_bytes_decode;
+from std/string import contains, ends_with, index, ord, replace, sprint, substr;
+
+const R2RML_NS := "http://www.w3.org/ns/r2rml#";
+const RR_IRI := R2RML_NS _ "IRI";
+const RR_BLANK_NODE := R2RML_NS _ "BlankNode";
+const RR_LITERAL := R2RML_NS _ "Literal";
+const RR_DEFAULT_GRAPH := R2RML_NS _ "defaultGraph";
+const RR_SQL2008 := R2RML_NS _ "SQL2008";
+const _RR_B64_ALPHABET := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function _rr ( String name ) {
+	return rdf_iri(R2RML_NS _ name);
+}
+
+function _rr_type () {
+	return rdf_iri(RDF_NS _ "type");
+}
+
+function _rr_is ( term, String iri ) {
+	return term instanceof RDFIRI and term.get_value() eq iri;
+}
+
+function _rr_term_string ( term ) {
+	return term.get_value()
+		if term instanceof RDFIRI
+		or term instanceof RDFBlank
+		or term instanceof RDFLiteral;
+	return "";
+}
+
+function _rr_objects ( Array quads, subject, predicate ) {
+	let s := rdf_term_key(subject);
+	let p := rdf_term_key(predicate);
+	let out := [];
+	for ( let quad in quads ) {
+		if (
+			rdf_term_key(quad.get_subject()) eq s
+			and rdf_term_key(quad.get_predicate()) eq p
+		) {
+			out.push(quad.get_object());
+		}
+	}
+	return out;
+}
+
+function _rr_one ( Array quads, subject, predicate ) {
+	let values := _rr_objects( quads, subject, predicate );
+	return values.length() == 0 ? null : values[0];
+}
+
+function _rr_subjects_with ( Array quads, predicate ) {
+	let p := rdf_term_key(predicate);
+	let seen := {};
+	let out := [];
+	for ( let quad in quads ) {
+		next unless rdf_term_key(quad.get_predicate()) eq p;
+		let key := rdf_term_key(quad.get_subject());
+		next if seen.exists(key);
+		seen.set( key, true );
+		out.push(quad.get_subject());
+	}
+	return out;
+}
+
+function _rr_string_value ( term, String label ) {
+	die "R2RML: " _ label _ " must be a literal"
+		unless term instanceof RDFLiteral;
+	return term.get_value();
+}
+
+function _rr_boolish_missing ( value ) {
+	return value == null;
+}
+
+function _rr_sql_identifier ( String raw ) {
+	return raw if raw ~ /^"([^"]|"")+"(\."([^"]|"")+"?)*$/;
+	return raw if raw ~ /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/;
+	die "R2RML: unsafe rr:tableName '" _ raw _ "'";
+}
+
+function _rr_row_get ( Dict row, String column ) {
+	return row{(column)} if row.exists(column);
+	return row{(lc(column))} if row.exists(lc(column));
+	return row{(uc(column))} if row.exists(uc(column));
+	if ( column ~ /^".*"$/ ) {
+		let unquoted := replace(substr( column, 1, (length column) - 2), "\"\"", "\"");
+		return row{(unquoted)} if row.exists(unquoted);
+		return row{(lc(unquoted))} if row.exists(lc(unquoted));
+		return row{(uc(unquoted))} if row.exists(uc(unquoted));
+	}
+	return null;
+}
+
+function _rr_column_present ( Dict row, String column ) {
+	return true if row.exists(column);
+	return true if row.exists(lc(column));
+	return true if row.exists(uc(column));
+	if ( column ~ /^".*"$/ ) {
+		let unquoted := replace(substr( column, 1, (length column) - 2), "\"\"", "\"");
+		return true if row.exists(unquoted);
+		return true if row.exists(lc(unquoted));
+		return true if row.exists(uc(unquoted));
+	}
+	return false;
+}
+
+function _rr_column_type_name ( Dict types, String column ) {
+	let key := "";
+	key := column if types.exists(column);
+	key := lc(column) if key eq "" and types.exists(lc(column));
+	key := uc(column) if key eq "" and types.exists(uc(column));
+	if ( key eq "" and column ~ /^".*"$/ ) {
+		let unquoted := replace(substr( column, 1, (length column) - 2), "\"\"", "\"");
+		key := unquoted if types.exists(unquoted);
+		key := lc(unquoted) if key eq "" and types.exists(lc(unquoted));
+		key := uc(unquoted) if key eq "" and types.exists(uc(unquoted));
+	}
+	return "" if key eq "";
+	let t := types{(key)};
+	return lc(t) if t instanceof String;
+	return lc(t{name}) if t instanceof Dict and t.exists("name");
+	return lc(t{type}) if t instanceof Dict and t.exists("type");
+	return lc(t{type_name}) if t instanceof Dict and t.exists("type_name");
+	return lc(t{database_type_name})
+		if t instanceof Dict and t.exists("database_type_name");
+	return "";
+}
+
+function _rr_datatype_for_value ( value, String sql_type ) {
+	switch ( lc sql_type : ~ ) {
+		case /(bigint|int|integer|smallint|tinyint)/:
+			return rdf_iri(XSD_NS _ "integer");
+		case /(decimal|numeric)/:
+			return rdf_iri(XSD_NS _ "decimal");
+		case /(double|float|real)/:
+			return rdf_iri(XSD_NS _ "double");
+		case /(bool|boolean)/:
+			return rdf_iri(XSD_NS _ "boolean");
+		case /(binary|blob)/:
+			return rdf_iri(XSD_NS _ "hexBinary");
+		case /(datetime|timestamp)/:
+			return rdf_iri(XSD_NS _ "dateTime");
+		case /\bdate\b/:
+			return rdf_iri(XSD_NS _ "date");
+		case /\btime\b/:
+			return rdf_iri(XSD_NS _ "time");
+	}
+	return rdf_iri(XSD_NS _ "integer")
+		if ( "" _ value ) ~ /^-?[0-9]+$/;
+	return rdf_iri(XSD_NS _ "decimal")
+		if ( "" _ value ) ~ /^-?[0-9]+\.[0-9]+$/;
+	return rdf_iri(XSD_NS _ "string");
+}
+
+function _rr_hex ( Number n ) {
+	let text := Math.dec2hex("" _ n);
+	text := "0" _ text if length text == 1;
+	return "%" _ uc(text);
+}
+
+function _rr_div_floor ( Number n, Number d ) {
+	return floor( n / d );
+}
+
+function _rr_binary_bytes ( BinaryString raw ) {
+	let b64 := _rr_b64_encode(raw);
+	let out := [];
+	let i := 0;
+	while ( i < length b64 ) {
+		let c0 := index( _RR_B64_ALPHABET, substr( b64, i, 1 ) );
+		let c1 := index( _RR_B64_ALPHABET, substr( b64, i + 1, 1 ) );
+		let ch2 := substr( b64, i + 2, 1 );
+		let ch3 := substr( b64, i + 3, 1 );
+		let c2 := -1;
+		let c3 := -1;
+		c2 := index( _RR_B64_ALPHABET, ch2 ) if ch2 ne "=";
+		c3 := index( _RR_B64_ALPHABET, ch3 ) if ch3 ne "=";
+
+		out.push( c0 * 4 + _rr_div_floor( c1, 16 ) );
+		out.push( ( c1 & 15 ) * 16 + _rr_div_floor( c2, 4 ) )
+			if c2 >= 0;
+		out.push( ( c2 & 3 ) * 64 + c3 )
+			if c3 >= 0;
+
+		i += 4;
+	}
+	return out;
+}
+
+function _rr_binary_hex ( BinaryString raw ) {
+	let out := "";
+	for ( let b in _rr_binary_bytes(raw) ) {
+		out _= substr( "0123456789ABCDEF", _rr_div_floor( b, 16 ) & 15, 1 );
+		out _= substr( "0123456789ABCDEF", b & 15, 1 );
+	}
+	return out;
+}
+
+function _rr_sql_type_is_binary ( String sql_type ) {
+	return lc(sql_type) ~ /(binary|blob)/;
+}
+
+function _rr_sql_char_width ( String sql_type ) {
+	let type := lc(sql_type);
+	let m := type ~ /^char\(([0-9]+)\)/;
+	return 0 + m[1] if m instanceof Array and m.length() > 1;
+	m := type ~ /^character\(([0-9]+)\)/;
+	return 0 + m[1] if m instanceof Array and m.length() > 1;
+	m := type ~ /^nchar\(([0-9]+)\)/;
+	return 0 + m[1] if m instanceof Array and m.length() > 1;
+	return 0;
+}
+
+function _rr_pad_fixed_char ( String text, String sql_type ) {
+	let out := text;
+	let width := _rr_sql_char_width(sql_type);
+	while ( width > 0 and length out < width ) {
+		out _= " ";
+	}
+	return out;
+}
+
+function _rr_value_text ( value, String sql_type := "" ) {
+	let text := "";
+	if ( value instanceof BinaryString ) {
+		text := _rr_sql_type_is_binary(sql_type)
+			? _rr_binary_hex(value)
+			: _rr_bytes_decode(value);
+	}
+	else if ( typeof value eq "Buffer" ) {
+		text := _rr_sql_type_is_binary(sql_type)
+			? uc(value.toString("hex"))
+			: value.toString("utf8");
+	}
+	else {
+		text := "" _ value;
+	}
+	return _rr_pad_fixed_char( text, sql_type );
+}
+
+function _rr_resolve_iri ( String value, String base ) {
+	return value if value ~ /^[A-Za-z][A-Za-z0-9+.-]*:/;
+	return value if base eq "";
+	return base _ value;
+}
+
+function _rr_iri_term ( String value ) {
+	die "R2RML: IRI term map produced an invalid IRI"
+		if value ~ /[\x00-\x20<>"{}|^`\\]/; // Fix for syntax highlighting: "
+	return rdf_iri(value);
+}
+
+function _rr_language_ok ( String lang ) {
+	return lang ~ /^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/;
+}
+
+function _rr_decimal_lexical ( value, Boolean force_fraction ) {
+	let text := sprint( "%.12f", value );
+	if ( contains( text, "." ) ) {
+		while ( ends_with( text, "0" ) and (
+			not force_fraction or not ends_with( text, ".0" )
+		) ) {
+			text := substr( text, 0, length(text) - 1 );
+		}
+		text := substr( text, 0, length(text) - 1 )
+			if ends_with( text, "." );
+	}
+	text _= ".0" if force_fraction and not contains( text, "." );
+	return text;
+}
+
+function _rr_double_lexical ( value ) {
+	let n := value < 0 ? -value : value;
+	let sign := value < 0 ? "-" : "";
+	return "0.0E0" if n == 0;
+	let exp := 0;
+	if ( n < 1 ) {
+		while ( n < 1 ) {
+			n *= 10;
+			exp++;
+		}
+		return sign _ _rr_decimal_lexical( n, true ) _ "E-" _ exp;
+	}
+	while ( n >= 10 ) {
+		n /= 10;
+		exp++;
+	}
+	return sign _ _rr_decimal_lexical( n, true ) _ "E" _ exp;
+}
+
+function _rr_percent_encode ( String text ) {
+	let out := "";
+	let i := 0;
+	while ( i < length text ) {
+		let ch := substr( text, i, 1 );
+		if ( ch ~ /^[A-Za-z0-9._~-]$/ ) {
+			out _= ch;
+		}
+		else {
+			out _= _rr_hex(ord( text, i ));
+		}
+		i++;
+	}
+	return out;
+}
+
+function _rr_template_value (
+	String template,
+	Dict row,
+	Dict types,
+	Boolean encode
+) {
+	let out := "";
+	let i := 0;
+	while ( i < length template ) {
+		let ch := substr( template, i, 1 );
+		if ( ch eq "\\" ) {
+			i++;
+			out _= substr( template, i, 1 ) if i < length template;
+			i++;
+			next;
+		}
+		if ( ch eq "{" ) {
+			let close := index( template, "}", i + 1 );
+			die "R2RML: unterminated rr:template column reference"
+				if close < 0;
+			let col := substr( template, i + 1, close - i - 1 );
+			die "R2RML: rr:template column reference must be delimited"
+				if not types.exists("_rr_query_columns")
+				and not (col ~ /^".*"$/)
+				and col ne lc(col);
+			die "R2RML: rr:template references unknown column " _ col
+				unless _rr_column_present( row, col );
+			let value := _rr_row_get( row, col );
+			return null if value == null;
+			let text := _rr_value_text(
+				value,
+				_rr_column_type_name( types, col ),
+			);
+			out _= encode ? _rr_percent_encode(text) : text;
+			i := close + 1;
+			next;
+		}
+		out _= ch;
+		i++;
+	}
+	return out;
+}
+
+function _rr_default_term_type ( String position, Boolean has_column,
+	Boolean has_template, Boolean has_lang_or_datatype ) {
+	return RR_LITERAL if position eq "object" and has_column;
+	return RR_LITERAL if position eq "object" and has_lang_or_datatype;
+	return RR_IRI if has_template;
+	return RR_IRI if position eq "subject" or position eq "predicate" or
+		position eq "graph";
+	return RR_LITERAL;
+}
+
+function _rr_term_type ( Array mapping, term_map, String position ) {
+	let explicit := _rr_one( mapping, term_map, _rr("termType") );
+	return explicit.get_value() if explicit instanceof RDFIRI;
+	let has_column := not (_rr_one( mapping, term_map, _rr("column") ) == null);
+	let has_template := not (_rr_one( mapping, term_map, _rr("template") ) == null);
+	let has_lang := not (_rr_one( mapping, term_map, _rr("language") ) == null);
+	let has_dt := not (_rr_one( mapping, term_map, _rr("datatype") ) == null);
+	return _rr_default_term_type(
+		position,
+		has_column,
+		has_template,
+		has_lang or has_dt,
+	);
+}
+
+function _rr_literal ( value, Array mapping, term_map, Dict types,
+	String column ) {
+	let lang := _rr_one( mapping, term_map, _rr("language") );
+	let datatype := _rr_one( mapping, term_map, _rr("datatype") );
+	let sql_type := _rr_column_type_name( types, column );
+	if ( not (lang == null) ) {
+		die "R2RML: rr:language must be a valid language tag"
+			unless _rr_language_ok(_rr_string_value( lang, "rr:language" ));
+		return rdf_literal(
+			_rr_value_text( value, sql_type ),
+			_rr_string_value( lang, "rr:language" ),
+		);
+	}
+	if ( datatype instanceof RDFIRI ) {
+		let text := _rr_value_text( value, sql_type );
+		text := replace( text, " ", "T" )
+			if datatype.get_value() eq XSD_NS _ "dateTime";
+		return rdf_literal( text, "", datatype );
+	}
+	let inferred := _rr_datatype_for_value(value, sql_type);
+	if ( inferred.get_value() eq XSD_NS _ "double" or
+		inferred.get_value() eq XSD_NS _ "float" ) {
+		return rdf_literal( _rr_double_lexical(0 + value), "", inferred );
+	}
+	if ( inferred.get_value() eq XSD_NS _ "boolean" ) {
+		return rdf_literal( (value ? "true" : "false"), "", inferred );
+	}
+	if ( inferred.get_value() eq XSD_NS _ "dateTime" ) {
+		return rdf_literal(
+			replace( _rr_value_text( value, sql_type ), " ", "T" ),
+			"",
+			inferred,
+		);
+	}
+	return rdf_literal(
+		_rr_value_text( value, sql_type ),
+		"",
+		inferred,
+	);
+}
+
+function _rr_term_from_value (
+	value,
+	String term_type,
+	String position,
+	Array mapping,
+	term_map,
+	Dict types,
+	String column,
+	String base
+) {
+	return null if value == null;
+	if ( term_type eq RR_LITERAL ) {
+		die "R2RML: literal subjects, predicates, and graphs are not allowed"
+			unless position eq "object";
+		return _rr_literal( value, mapping, term_map, types, column );
+	}
+	if ( term_type eq RR_BLANK_NODE ) {
+		die "R2RML: blank-node predicates and graphs are not allowed"
+			if position eq "predicate" or position eq "graph";
+		return rdf_blank(
+			_rr_value_text( value, _rr_column_type_name( types, column ) ),
+		);
+	}
+	die "R2RML: IRI term map produced an empty value"
+		if _rr_value_text( value, _rr_column_type_name( types, column ) ) eq "";
+	return _rr_iri_term(_rr_resolve_iri(
+		_rr_value_text( value, _rr_column_type_name( types, column ) ),
+		base,
+	));
+}
+
+function _rr_constant_term ( term, String position ) {
+	if ( position eq "graph" and _rr_is( term, RR_DEFAULT_GRAPH ) ) {
+		return rdf_default_graph();
+	}
+	die "R2RML: predicate maps must produce IRIs"
+		if position eq "predicate" and not (term instanceof RDFIRI);
+	die "R2RML: graph maps must produce IRIs or rr:defaultGraph"
+		if position eq "graph" and not (term instanceof RDFIRI);
+	die "R2RML: subject maps must produce IRIs or blank nodes"
+		if position eq "subject" and not (term instanceof RDFIRI) and
+		not (term instanceof RDFBlank);
+	return term;
+}
+
+function _rr_term_from_map (
+	Array mapping,
+	term_map,
+	Dict row,
+	Dict types,
+	String position,
+	String base := ""
+) {
+	let constant := _rr_one( mapping, term_map, _rr("constant") );
+	return _rr_constant_term( constant, position ) unless constant == null;
+
+	let column := _rr_one( mapping, term_map, _rr("column") );
+	if ( not (column == null) ) {
+		let col := _rr_string_value( column, "rr:column" );
+		die "R2RML: rr:column references unknown column " _ col
+			unless _rr_column_present( row, col );
+		let value := _rr_row_get( row, col );
+			return _rr_term_from_value(
+				value,
+				_rr_term_type( mapping, term_map, position ),
+				position,
+				mapping,
+				term_map,
+				types,
+				col,
+				base,
+			);
+	}
+
+		let template := _rr_one( mapping, term_map, _rr("template") );
+		if ( not (template == null) ) {
+			let term_type := _rr_term_type( mapping, term_map, position );
+			let value := _rr_template_value(
+				_rr_string_value( template, "rr:template" ),
+				row,
+				types,
+				not (term_type eq RR_LITERAL),
+			);
+			return _rr_term_from_value(
+				value,
+				term_type,
+				position,
+				mapping,
+				term_map,
+				types,
+				"",
+				base,
+			);
+	}
+
+	die "R2RML: term map needs one of rr:constant, rr:column, rr:template";
+}
+
+function _rr_validate_mapping ( Array mapping ) {
+	for ( let logical in _rr_subjects_with( mapping, _rr("sqlVersion") ) ) {
+		for ( let version in _rr_objects( mapping, logical, _rr("sqlVersion") ) ) {
+			die "R2RML: unsupported rr:sqlVersion"
+				unless _rr_is( version, RR_SQL2008 );
+		}
+	}
+	for ( let triples_map in _rr_subjects_with( mapping, _rr("logicalTable") ) ) {
+		let subjects := _rr_objects( mapping, triples_map, _rr("subject") );
+		let subject_maps := _rr_objects( mapping, triples_map, _rr("subjectMap") );
+		die "R2RML: triples map must not have multiple subject maps"
+			if subjects.length() + subject_maps.length() > 1;
+	}
+}
+
+function _rr_term_maps ( Array mapping, subject, String shortcut,
+	String map_property ) {
+	let out := [];
+	for ( let constant in _rr_objects( mapping, subject, _rr(shortcut) ) ) {
+		out.push({ constant: constant });
+	}
+	for ( let map in _rr_objects( mapping, subject, _rr(map_property) ) ) {
+		out.push(map);
+	}
+	return out;
+}
+
+function _rr_term_from_spec (
+	Array mapping,
+	spec,
+	Dict row,
+	Dict types,
+	String position,
+	String base := ""
+) {
+	return _rr_constant_term( spec{constant}, position )
+		if typeof spec eq "Dict" and spec.exists("constant");
+	return _rr_term_from_map( mapping, spec, row, types, position, base );
+}
+
+function _rr_graph_terms (
+	Array mapping,
+	owner,
+	Dict row,
+	Dict types,
+	Boolean default_graph := true,
+	String base := ""
+) {
+	let graphs := _rr_term_maps( mapping, owner, "graph", "graphMap" );
+	if ( graphs.length() == 0 ) {
+		return default_graph ? [ rdf_default_graph() ] : [];
+	}
+	let out := [];
+	for ( let graph_map in graphs ) {
+		let graph := _rr_term_from_spec(
+			mapping,
+			graph_map,
+			row,
+			types,
+			"graph",
+			base,
+		);
+		out.push(graph) unless graph == null;
+	}
+	return out.length() == 0 and default_graph ? [ rdf_default_graph() ] : out;
+}
+
+function _rr_effective_graph_terms (
+	Array mapping,
+	subject_map,
+	po_map,
+	Dict row,
+	Dict types,
+	String base := ""
+) {
+	let out := _rr_graph_terms( mapping, subject_map, row, types, false, base );
+	for ( let graph in _rr_graph_terms( mapping, po_map, row, types, false, base ) ) {
+		out.push(graph);
+	}
+	return out.length() == 0 ? [ rdf_default_graph() ] : out;
+}
+
+function r2rml_parse_mapping ( mapping, parser := null, String base := "" ) {
+	return mapping if mapping instanceof Array;
+	let actual_parser := parser == null ? new TurtleParser() : parser;
+	return actual_parser.parse_string( "" _ mapping, base: base );
+}
+
+class R2RMLProcessor {
+	let dbh with get := null;
+	let String base_iri := "";
+	let Array mapping_quads := [];
+	let Dict row_cache := {};
+
+	method _logical_table ( triples_map ) {
+		let logical := _rr_one( mapping_quads, triples_map, _rr("logicalTable") );
+		die "R2RML: triples map is missing rr:logicalTable"
+			if logical == null;
+		return logical;
+	}
+
+	method _logical_rows ( triples_map ) {
+		let key := rdf_term_key(triples_map);
+		return row_cache{(key)} if row_cache.exists(key);
+
+		let logical := self._logical_table(triples_map);
+		let table := _rr_one( mapping_quads, logical, _rr("tableName") );
+		let query := _rr_one( mapping_quads, logical, _rr("sqlQuery") );
+		die "R2RML: logical table needs rr:tableName or rr:sqlQuery"
+			if table == null and query == null;
+		die "R2RML: logical table must not have both rr:tableName and rr:sqlQuery"
+			if not (table == null) and not (query == null);
+
+		let sql := query == null
+			? "select * from " _ _rr_sql_identifier(
+				_rr_string_value( table, "rr:tableName" )
+			)
+			: _rr_string_value( query, "rr:sqlQuery" );
+		let stmt := dbh.prepare(sql);
+		stmt.execute();
+		let names := stmt.column_names();
+		let raw_types := stmt.column_types();
+		let types := {};
+		types.set( "_rr_query_columns", true )
+			if not (query == null);
+		let seen_names := {};
+		for ( let name in names ) {
+			die "R2RML: logical table query returned duplicate column " _ name
+				if seen_names.exists(name);
+			seen_names.set( name, true );
+		}
+		if ( not (table == null) ) {
+			try {
+				let meta_stmt := dbh.prepare(
+					"pragma table_info(" _
+					_rr_sql_identifier(_rr_string_value(table, "rr:tableName")) _
+					")",
+				);
+				meta_stmt.execute();
+				for ( let meta in meta_stmt.all_dict() ) {
+					types.set( meta{name}, meta{type} )
+						if meta.exists("name") and meta.exists("type");
+				}
+			}
+			catch {
+			}
+		}
+		let i := 0;
+		for ( let name in names ) {
+			types.set( name, raw_types[i] )
+				if i < raw_types.length() and not types.exists(name);
+			i++;
+		}
+		let result := { rows: stmt.all_typed_dict(), types: types };
+		row_cache.set( key, result );
+		return result;
+	}
+
+	method _subject_map ( triples_map ) {
+		let subject := _rr_one( mapping_quads, triples_map, _rr("subject") );
+		if ( not (subject == null) ) {
+			return { constant: subject };
+		}
+		let subject_map := _rr_one( mapping_quads, triples_map, _rr("subjectMap") );
+		die "R2RML: triples map is missing rr:subjectMap"
+			if subject_map == null;
+		return subject_map;
+	}
+
+	method _subject_for_row ( triples_map, Dict row, Dict types ) {
+		return _rr_term_from_spec(
+			mapping_quads,
+			self._subject_map(triples_map),
+			row,
+			types,
+			"subject",
+			base_iri,
+		);
+	}
+
+	method _parent_objects ( object_map, Dict child_row ) {
+		let parent_map := _rr_one(
+			mapping_quads,
+			object_map,
+			_rr("parentTriplesMap"),
+		);
+		return null if parent_map == null;
+
+		let child_rows := { rows: [ child_row ], types: {} };
+		let parent_rows := self._logical_rows(parent_map);
+		let joins := _rr_objects( mapping_quads, object_map, _rr("joinCondition") );
+		let out := [];
+		for ( let parent_row in parent_rows{rows} ) {
+			let match := true;
+			for ( let join_map in joins ) {
+				let child_col := _rr_string_value(
+					_rr_one( mapping_quads, join_map, _rr("child") ),
+					"rr:child",
+				);
+				let parent_col := _rr_string_value(
+					_rr_one( mapping_quads, join_map, _rr("parent") ),
+					"rr:parent",
+				);
+				if (
+					not _rr_column_present( child_row, child_col )
+					or not _rr_column_present( parent_row, parent_col )
+					or _rr_row_get( child_row, child_col ) == null
+					or _rr_row_get( parent_row, parent_col ) == null
+					or ( "" _ _rr_row_get( child_row, child_col ) ) ne
+						( "" _ _rr_row_get( parent_row, parent_col ) )
+				) {
+					match := false;
+				}
+			}
+			next unless match;
+			let subject := self._subject_for_row(
+				parent_map,
+				parent_row,
+				parent_rows{types},
+			);
+			out.push(subject) unless subject == null;
+		}
+		return out;
+	}
+
+	method _object_terms ( object_map, Dict row, Dict types ) {
+		if ( typeof object_map eq "Dict" and object_map.exists("constant") ) {
+			let term := _rr_term_from_spec(
+				mapping_quads,
+				object_map,
+				row,
+				types,
+				"object",
+				base_iri,
+			);
+			return term == null ? [] : [ term ];
+		}
+		let parent := self._parent_objects( object_map, row );
+		return parent unless parent == null;
+		let term := _rr_term_from_spec(
+			mapping_quads,
+			object_map,
+			row,
+				types,
+				"object",
+				base_iri,
+			);
+		return term == null ? [] : [ term ];
+	}
+
+	method _triples_maps () {
+		return _rr_subjects_with( mapping_quads, _rr("logicalTable") );
+	}
+
+	method materialize ( mapping, into := null, parser := null,
+		String base := "" ) {
+		base_iri := base;
+		mapping_quads := r2rml_parse_mapping( mapping, parser, base );
+		_rr_validate_mapping(mapping_quads);
+		row_cache := {};
+		let out := [];
+
+		for ( let triples_map in self._triples_maps() ) {
+			let logical := self._logical_rows(triples_map);
+			let subject_map := self._subject_map(triples_map);
+			for ( let row in logical{rows} ) {
+				let subject := self._subject_for_row(
+					triples_map,
+					row,
+					logical{types},
+				);
+				next if subject == null;
+					let subject_graphs := _rr_graph_terms(
+						mapping_quads,
+						subject_map,
+						row,
+						logical{types},
+						true,
+						base_iri,
+					);
+				for ( let class_term in _rr_objects(
+					mapping_quads,
+					subject_map,
+					_rr("class"),
+				) ) {
+					for ( let graph in subject_graphs ) {
+						out.push(rdf_quad( subject, _rr_type(), class_term, graph ));
+					}
+				}
+
+				for ( let po_map in _rr_objects(
+					mapping_quads,
+					triples_map,
+					_rr("predicateObjectMap"),
+				) ) {
+					let predicate_maps := _rr_term_maps(
+						mapping_quads,
+						po_map,
+						"predicate",
+						"predicateMap",
+					);
+					let object_maps := _rr_term_maps(
+						mapping_quads,
+						po_map,
+						"object",
+						"objectMap",
+					);
+					for ( let predicate_map in predicate_maps ) {
+						let predicate := _rr_term_from_spec(
+							mapping_quads,
+							predicate_map,
+								row,
+								logical{types},
+								"predicate",
+								base_iri,
+							);
+						next if predicate == null;
+						for ( let object_map in object_maps ) {
+							let objects := self._object_terms(
+								object_map,
+								row,
+								logical{types},
+							);
+							let graphs := _rr_effective_graph_terms(
+								mapping_quads,
+								subject_map,
+								po_map,
+								row,
+								logical{types},
+								base_iri,
+							);
+							for ( let object in objects ) {
+								for ( let graph in graphs ) {
+									out.push(rdf_quad( subject, predicate, object, graph ));
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		out := rdf_quads_unique(out);
+		if ( not (into == null) ) {
+			into.add_quads(out);
+			return into;
+		}
+		return out;
+	}
+}
+
+function r2rml_materialize ( dbh, mapping, ... PairList options ) {
+	let processor := new R2RMLProcessor(dbh: dbh);
+	return processor.materialize(
+		mapping,
+		options.exists("into") ? options{into} : null,
+		options.exists("parser") ? options{parser} : null,
+		options.exists("base") ? "" _ options{base} : "",
+	);
+}

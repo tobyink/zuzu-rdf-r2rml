@@ -1,0 +1,207 @@
+from test/more import *;
+
+requires_capability("db");
+
+from rdf import
+	RDFStore,
+	RDF_NS,
+	TurtleParser,
+	XSD_NS,
+	rdf_iri,
+	rdf_literal,
+	rdf_term_key;
+from rdf/r2rml import R2RMLProcessor, r2rml_materialize, r2rml_parse_mapping;
+from std/db import DB;
+
+function has_quad ( Array quads, subject, predicate, object, graph := null ) {
+	let wanted_graph := graph == null ? null : rdf_term_key(graph);
+	for ( let quad in quads ) {
+		next unless rdf_term_key(quad.get_subject()) eq rdf_term_key(subject);
+		next unless rdf_term_key(quad.get_predicate()) eq rdf_term_key(predicate);
+		next unless rdf_term_key(quad.get_object()) eq rdf_term_key(object);
+		next if wanted_graph != null and
+			rdf_term_key(quad.get_graph()) ne wanted_graph;
+		return true;
+	}
+	return false;
+}
+
+let dbh := DB.temp();
+dbh.prepare(
+	"create table people (id integer, name text, dept integer, nick text)",
+).execute();
+dbh.prepare(
+	"create table departments (id integer, label text)",
+).execute();
+dbh.prepare(
+	"insert into people (id, name, dept, nick) values (1, 'Ada Lovelace', 10, 'ada')",
+).execute();
+dbh.prepare(
+	"insert into people (id, name, dept, nick) values (2, 'Grace Hopper', 20, null)",
+).execute();
+dbh.prepare(
+	"insert into departments (id, label) values (10, 'Mathematics')",
+).execute();
+dbh.prepare(
+	"insert into departments (id, label) values (20, 'Compilers')",
+).execute();
+
+let mapping := """
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.com/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<#People>
+	rr:logicalTable [ rr:tableName "people" ];
+	rr:subjectMap [
+		rr:template "http://example.com/person/{id}";
+		rr:class ex:Person;
+		rr:graph ex:peopleGraph;
+	];
+	rr:predicateObjectMap [
+		rr:predicate ex:name;
+		rr:objectMap [ rr:column "name"; rr:language "en" ];
+	];
+	rr:predicateObjectMap [
+		rr:predicate ex:id;
+		rr:objectMap [ rr:column "id"; rr:datatype xsd:integer ];
+	];
+	rr:predicateObjectMap [
+		rr:predicate ex:nick;
+		rr:objectMap [ rr:column "nick" ];
+	];
+	rr:predicateObjectMap [
+		rr:predicate ex:department;
+		rr:objectMap [
+			rr:parentTriplesMap <#Departments>;
+			rr:joinCondition [
+				rr:child "dept";
+				rr:parent "id";
+			];
+		];
+	].
+
+<#Departments>
+	rr:logicalTable [
+		rr:sqlQuery "select id, label from departments";
+	];
+	rr:subjectMap [
+		rr:template "http://example.com/department/{id}";
+		rr:class ex:Department;
+	];
+	rr:predicateObjectMap [
+		rr:predicate ex:label;
+		rr:objectMap [ rr:column "label" ];
+	].
+""";
+
+let quads := r2rml_materialize( dbh, mapping );
+
+ok(
+	has_quad(
+		quads,
+		rdf_iri("http://example.com/person/1"),
+		rdf_iri(RDF_NS _ "type"),
+		rdf_iri("http://example.com/Person"),
+		rdf_iri("http://example.com/peopleGraph"),
+	),
+	"rr:class triples use subject-map graph",
+);
+ok(
+	has_quad(
+		quads,
+		rdf_iri("http://example.com/person/1"),
+		rdf_iri("http://example.com/name"),
+		rdf_literal("Ada Lovelace", "en"),
+	),
+	"rr:column object maps can produce language-tagged literals",
+);
+ok(
+	has_quad(
+		quads,
+		rdf_iri("http://example.com/person/1"),
+		rdf_iri("http://example.com/name"),
+		rdf_literal("Ada Lovelace", "en"),
+		rdf_iri("http://example.com/peopleGraph"),
+	),
+	"subject-map graph maps apply to predicate-object triples",
+);
+ok(
+	has_quad(
+		quads,
+		rdf_iri("http://example.com/person/1"),
+		rdf_iri("http://example.com/id"),
+		rdf_literal("1", "", rdf_iri(XSD_NS _ "integer")),
+	),
+	"rr:datatype overrides object-map datatype",
+);
+ok(
+	not has_quad(
+		quads,
+		rdf_iri("http://example.com/person/2"),
+		rdf_iri("http://example.com/nick"),
+		rdf_literal(""),
+	),
+	"null column values do not generate terms",
+);
+ok(
+	has_quad(
+		quads,
+		rdf_iri("http://example.com/person/2"),
+		rdf_iri("http://example.com/department"),
+		rdf_iri("http://example.com/department/20"),
+	),
+	"referencing object maps follow join conditions",
+);
+ok(
+	has_quad(
+		quads,
+		rdf_iri("http://example.com/department/10"),
+		rdf_iri("http://example.com/label"),
+		rdf_literal("Mathematics"),
+	),
+	"rr:sqlQuery logical tables materialize rows",
+);
+
+let parsed_mapping := r2rml_parse_mapping( mapping, new TurtleParser() );
+is(
+	( new R2RMLProcessor(dbh: dbh) ).materialize(parsed_mapping).length(),
+	quads.length(),
+	"pre-parsed mapping quads are accepted",
+);
+
+let store := RDFStore.temp();
+store.install_schema();
+is( r2rml_materialize( dbh, mapping, into: store ), store, "into returns store" );
+ok(
+	store.find(
+		rdf_iri("http://example.com/person/1"),
+		rdf_iri("http://example.com/department"),
+	).length() == 1,
+	"into store receives generated quads",
+);
+
+let blank_mapping := """
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.com/> .
+
+<#Blank>
+	rr:logicalTable [ rr:tableName "people" ];
+	rr:subjectMap [
+		rr:template "person-{id}";
+		rr:termType rr:BlankNode;
+	];
+	rr:predicateObjectMap [
+		rr:predicate ex:name;
+		rr:objectMap [ rr:column "name" ];
+	].
+""";
+
+let blank_quads := r2rml_materialize( dbh, blank_mapping );
+is(
+	blank_quads[0].get_subject().get_value(),
+	"person-1",
+	"rr:termType rr:BlankNode creates blank-node subjects",
+);
+
+done_testing();
